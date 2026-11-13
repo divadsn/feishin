@@ -11,14 +11,27 @@ import {
     WebPlayerEngine,
     WebPlayerEngineHandle,
 } from '/@/renderer/features/player/audio-player/engine/web-player-engine';
-import { useBeatAnalysis } from '/@/renderer/features/player/audio-player/hooks/use-beat-analysis';
+import { useAutoMixLookahead } from '/@/renderer/features/player/audio-player/hooks/use-auto-mix-lookahead';
+import { useMixAnalysis } from '/@/renderer/features/player/audio-player/hooks/use-mix-analysis';
 import { usePlayerEvents } from '/@/renderer/features/player/audio-player/hooks/use-player-events';
 import { useSongUrl } from '/@/renderer/features/player/audio-player/hooks/use-stream-url';
 import { PlayerOnProgressProps } from '/@/renderer/features/player/audio-player/types';
-import { MixPlan, planMix } from '/@/renderer/features/player/audio-player/utils/auto-mix';
+import {
+    MixPlan,
+    planMix,
+    shouldSkipAutoMixAfterSeek,
+} from '/@/renderer/features/player/audio-player/utils/auto-mix';
+import {
+    connectDeckFx,
+    createDeckFx,
+    DeckFx,
+    resetDeckFx,
+    scheduleMixFx,
+} from '/@/renderer/features/player/audio-player/utils/auto-mix-fx';
 import { usePlayer } from '/@/renderer/features/player/context/player-context';
 import { useWebAudio } from '/@/renderer/features/player/hooks/use-webaudio';
 import {
+    useAutoMixSettings,
     useMpvSettings,
     usePlaybackSettings,
     usePlayerActions,
@@ -36,6 +49,7 @@ import { CrossfadeStyle, PlayerRepeat, PlayerStatus, PlayerStyle } from '/@/shar
 
 const PLAY_PAUSE_FADE_DURATION = 300;
 const PLAY_PAUSE_FADE_INTERVAL = 10;
+const AUTO_MIX_FALLBACK_FADE_DURATION = 8;
 
 export function WebPlayer() {
     const playerRef = useRef<null | WebPlayerEngineHandle>(null);
@@ -54,8 +68,11 @@ export function WebPlayer() {
     const player1Url = useSongUrl(player1, num === 1, transcode);
     const player2Url = useSongUrl(player2, num === 2, transcode);
     const mixEnabled = transitionType === PlayerStyle.AUTO_MIX && repeat !== PlayerRepeat.ONE;
-    const analysis1 = useBeatAnalysis(player1, player1Url, mixEnabled && Boolean(player2));
-    const analysis2 = useBeatAnalysis(player2, player2Url, mixEnabled && Boolean(player1));
+    const analysis1 = useMixAnalysis(player1, player1Url, mixEnabled && Boolean(player2));
+    const analysis2 = useMixAnalysis(player2, player2Url, mixEnabled && Boolean(player1));
+    const autoMix = useAutoMixSettings();
+    useAutoMixLookahead(mixEnabled);
+    const deckFxRef = useRef<[DeckFx | null, DeckFx | null]>([null, null]);
 
     const pendingLocalSeekRef = useRef(-1);
     const mixRef = useRef<null | {
@@ -68,6 +85,7 @@ export function WebPlayer() {
     }>(null);
     const mixRampRef = useRef<null | ReturnType<typeof setInterval>>(null);
     const mixHandoffRef = useRef(false);
+    const skipAutoMixForTrackRef = useRef(false);
 
     const [localPlayerStatus, setLocalPlayerStatus] = useState<PlayerStatus>(() => {
         if (playerHandoff.pendingLocalSeek > 0) {
@@ -91,6 +109,8 @@ export function WebPlayer() {
         const mix = mixRef.current;
         mixRef.current = null;
         if (!mix) return;
+        resetDeckFx(deckFxRef.current[0]);
+        resetDeckFx(deckFxRef.current[1]);
         mix.incoming.playbackRate = usePlayerStoreBase.getState().player.speed;
         if (!mix.handedOff) {
             mix.incoming.pause();
@@ -119,6 +139,8 @@ export function WebPlayer() {
                 return;
             }
             mix.handedOff = true;
+            resetDeckFx(deckFxRef.current[0]);
+            resetDeckFx(deckFxRef.current[1]);
             const initialTime = mix.incoming.currentTime;
             const target = state.player.speed;
             if (mix.rate === target) {
@@ -139,6 +161,24 @@ export function WebPlayer() {
             }, 100);
         },
         [cancelMix],
+    );
+
+    const scheduleFx = useCallback(
+        (outgoing: 1 | 2, plan: MixPlan | null, mediaTime: number, fadeDuration: number) => {
+            const outgoingFx = deckFxRef.current[outgoing - 1];
+            const incomingFx = deckFxRef.current[2 - outgoing];
+            if (!webAudio || !autoMix.eqTransitions || !outgoingFx || !incomingFx) return;
+            scheduleMixFx({
+                context: webAudio.context,
+                fadeDuration,
+                incoming: incomingFx,
+                mediaTime,
+                outgoing: outgoingFx,
+                plan,
+                rate: usePlayerStoreBase.getState().player.speed,
+            });
+        },
+        [autoMix.eqTransitions, webAudio],
     );
 
     const fadeAndSetStatus = useCallback(
@@ -226,23 +266,33 @@ export function WebPlayer() {
                 handleRepeatOne(1, e.playedSeconds, getDuration(playerRef.current.player1().ref));
                 return;
             }
+            if (transitionType === PlayerStyle.AUTO_MIX && skipAutoMixForTrackRef.current) return;
 
+            const currentDuration = getDuration(playerRef.current.player1().ref);
+            const outgoingAnalysis = num === 1 ? analysis1 : analysis2;
+            const incomingAnalysis = num === 1 ? analysis2 : analysis1;
+            const autoMixPlan =
+                transitionType === PlayerStyle.AUTO_MIX && outgoingAnalysis && incomingAnalysis
+                    ? planMix(outgoingAnalysis, incomingAnalysis, currentDuration, speed, autoMix)
+                    : null;
             const fadeDuration =
                 transitionType === PlayerStyle.AUTO_MIX
-                    ? Math.min(crossfadeDuration, (player2?.duration ?? 0) / 2500)
+                    ? (autoMixPlan?.fadeDuration ?? AUTO_MIX_FALLBACK_FADE_DURATION)
                     : crossfadeDuration;
-            if (transitionType === PlayerStyle.AUTO_MIX && fadeDuration <= 0) return;
 
             switch (transitionType) {
                 case PlayerStyle.AUTO_MIX:
                 case PlayerStyle.CROSSFADE:
                     crossfadeHandler({
                         crossfadeDuration: fadeDuration,
-                        crossfadeStyle,
+                        crossfadeStyle:
+                            transitionType === PlayerStyle.AUTO_MIX
+                                ? CrossfadeStyle.EQUAL_POWER
+                                : crossfadeStyle,
                         currentPlayer: playerRef.current.player1(),
                         currentPlayerNum: num,
                         currentTime: e.playedSeconds,
-                        duration: getDuration(playerRef.current.player1().ref),
+                        duration: currentDuration,
                         hasNextSong: Boolean(player2),
                         isTransitioning,
                         mix:
@@ -269,17 +319,9 @@ export function WebPlayer() {
                                               outgoing: 1,
                                               rate,
                                           };
+                                          scheduleFx(1, autoMixPlan, fadeStart, fadeDuration);
                                       },
-                                      plan:
-                                          analysis1 && analysis2
-                                              ? planMix(
-                                                    analysis1.end,
-                                                    analysis2.start,
-                                                    getDuration(playerRef.current.player1().ref),
-                                                    fadeDuration,
-                                                    speed,
-                                                )
-                                              : null,
+                                      plan: autoMixPlan,
                                       speed,
                                   }
                                 : undefined,
@@ -307,12 +349,14 @@ export function WebPlayer() {
             crossfadeStyle,
             analysis1,
             analysis2,
+            autoMix,
             cancelMix,
             handleRepeatOne,
             isTransitioning,
             mediaPause,
             num,
             player2,
+            scheduleFx,
             repeat,
             speed,
             setTimestamp,
@@ -339,23 +383,33 @@ export function WebPlayer() {
                 handleRepeatOne(2, e.playedSeconds, getDuration(playerRef.current.player2().ref));
                 return;
             }
+            if (transitionType === PlayerStyle.AUTO_MIX && skipAutoMixForTrackRef.current) return;
 
+            const currentDuration = getDuration(playerRef.current.player2().ref);
+            const outgoingAnalysis = num === 2 ? analysis2 : analysis1;
+            const incomingAnalysis = num === 2 ? analysis1 : analysis2;
+            const autoMixPlan =
+                transitionType === PlayerStyle.AUTO_MIX && outgoingAnalysis && incomingAnalysis
+                    ? planMix(outgoingAnalysis, incomingAnalysis, currentDuration, speed, autoMix)
+                    : null;
             const fadeDuration =
                 transitionType === PlayerStyle.AUTO_MIX
-                    ? Math.min(crossfadeDuration, (player1?.duration ?? 0) / 2500)
+                    ? (autoMixPlan?.fadeDuration ?? AUTO_MIX_FALLBACK_FADE_DURATION)
                     : crossfadeDuration;
-            if (transitionType === PlayerStyle.AUTO_MIX && fadeDuration <= 0) return;
 
             switch (transitionType) {
                 case PlayerStyle.AUTO_MIX:
                 case PlayerStyle.CROSSFADE:
                     crossfadeHandler({
                         crossfadeDuration: fadeDuration,
-                        crossfadeStyle,
+                        crossfadeStyle:
+                            transitionType === PlayerStyle.AUTO_MIX
+                                ? CrossfadeStyle.EQUAL_POWER
+                                : crossfadeStyle,
                         currentPlayer: playerRef.current.player2(),
                         currentPlayerNum: num,
                         currentTime: e.playedSeconds,
-                        duration: getDuration(playerRef.current.player2().ref),
+                        duration: currentDuration,
                         hasNextSong: Boolean(player1),
                         isTransitioning,
                         mix:
@@ -382,17 +436,9 @@ export function WebPlayer() {
                                               outgoing: 2,
                                               rate,
                                           };
+                                          scheduleFx(2, autoMixPlan, fadeStart, fadeDuration);
                                       },
-                                      plan:
-                                          analysis2 && analysis1
-                                              ? planMix(
-                                                    analysis2.end,
-                                                    analysis1.start,
-                                                    getDuration(playerRef.current.player2().ref),
-                                                    fadeDuration,
-                                                    speed,
-                                                )
-                                              : null,
+                                      plan: autoMixPlan,
                                       speed,
                                   }
                                 : undefined,
@@ -420,12 +466,14 @@ export function WebPlayer() {
             crossfadeStyle,
             analysis1,
             analysis2,
+            autoMix,
             cancelMix,
             handleRepeatOne,
             isTransitioning,
             mediaPause,
             num,
             player1,
+            scheduleFx,
             repeat,
             speed,
             setTimestamp,
@@ -484,6 +532,7 @@ export function WebPlayer() {
     usePlayerEvents(
         {
             onCurrentSongChange: () => {
+                skipAutoMixForTrackRef.current = false;
                 if (!mixHandoffRef.current) cancelMix();
                 setIsTransitioning(false);
             },
@@ -496,12 +545,40 @@ export function WebPlayer() {
                     setIsTransitioning(false);
                 }
             },
-            onPlayerRepeat: () => cancelMix(),
+            onPlayerRepeat: () => {
+                skipAutoMixForTrackRef.current = false;
+                cancelMix();
+            },
             onPlayerSeekToTimestamp: (properties) => {
+                const timestamp = properties.timestamp;
+                if (transitionType === PlayerStyle.AUTO_MIX) {
+                    const currentDuration = getDuration(
+                        num === 1
+                            ? playerRef.current?.player1()?.ref
+                            : playerRef.current?.player2()?.ref,
+                    );
+                    const outgoingAnalysis = num === 1 ? analysis1 : analysis2;
+                    const incomingAnalysis = num === 1 ? analysis2 : analysis1;
+                    const autoMixPlan =
+                        outgoingAnalysis && incomingAnalysis
+                            ? planMix(
+                                  outgoingAnalysis,
+                                  incomingAnalysis,
+                                  currentDuration,
+                                  speed,
+                                  autoMix,
+                              )
+                            : null;
+                    skipAutoMixForTrackRef.current = shouldSkipAutoMixAfterSeek(
+                        timestamp,
+                        currentDuration,
+                        autoMixPlan,
+                        AUTO_MIX_FALLBACK_FADE_DURATION,
+                    );
+                }
+
                 cancelMix();
                 setIsTransitioning(false);
-
-                const timestamp = properties.timestamp;
 
                 // Reset transition state if seeking during a crossfade transition
                 if (isTransitioning && transitionType === PlayerStyle.CROSSFADE) {
@@ -579,7 +656,18 @@ export function WebPlayer() {
                 player.mediaStop();
             },
         },
-        [volume, num, isTransitioning, transitionType, audioFadeOnStatusChange, cancelMix],
+        [
+            analysis1,
+            analysis2,
+            audioFadeOnStatusChange,
+            autoMix,
+            cancelMix,
+            isTransitioning,
+            num,
+            speed,
+            transitionType,
+            volume,
+        ],
     );
 
     // Cleanup fade interval on unmount
@@ -594,7 +682,10 @@ export function WebPlayer() {
     }, [cancelMix]);
 
     useEffect(() => {
-        if (transitionType !== PlayerStyle.AUTO_MIX) cancelMix();
+        if (transitionType !== PlayerStyle.AUTO_MIX) {
+            skipAutoMixForTrackRef.current = false;
+            cancelMix();
+        }
     }, [cancelMix, transitionType]);
 
     useEffect(() => {
@@ -755,7 +846,8 @@ export function WebPlayer() {
             if (internal) {
                 const { context, gains } = webAudio;
                 const source = context.createMediaElementSource(internal);
-                source.connect(gains[0]);
+                deckFxRef.current[0] = createDeckFx(context);
+                connectDeckFx(source, deckFxRef.current[0], gains[0]);
                 setPlayer1Source(source);
             }
         },
@@ -776,7 +868,8 @@ export function WebPlayer() {
             if (internal) {
                 const { context, gains } = webAudio;
                 const source = context.createMediaElementSource(internal);
-                source.connect(gains[1]);
+                deckFxRef.current[1] = createDeckFx(context);
+                connectDeckFx(source, deckFxRef.current[1], gains[1]);
                 setPlayer2Source(source);
             }
         },
@@ -914,14 +1007,15 @@ function crossfadeHandler(args: {
                     incoming.readyState < 3
                 )
                     return;
-                const canMatch = mix.plan && currentTime - start < 0.15;
-                const rate = canMatch ? mix.plan.rate : mix.speed;
+                const plan = mix.plan;
+                const canMatch = Boolean(plan && currentTime - start < 0.15);
+                const rate = canMatch && plan ? plan.rate : mix.speed;
                 incoming.playbackRate = rate;
                 if (incoming.readyState > 0) {
                     try {
-                        incoming.currentTime = canMatch
-                            ? ((currentTime - start) * rate) / mix.speed
-                            : 0;
+                        incoming.currentTime =
+                            (mix.plan?.incomingStart ?? 0) +
+                            (canMatch ? ((currentTime - start) * rate) / mix.speed : 0);
                     } catch (error) {
                         logger.warn('Auto mix could not seek the next track', { error });
                         incoming.playbackRate = mix.speed;
@@ -950,10 +1044,9 @@ function crossfadeHandler(args: {
         return;
     }
 
-    const timeLeft = duration - currentTime;
-
-    const fadeDuration =
-        mix?.fadeStart === undefined ? crossfadeDuration : duration - mix.fadeStart;
+    const fadeEnd = mix?.plan?.fadeEnd ?? duration;
+    const timeLeft = fadeEnd - currentTime;
+    const fadeDuration = mix?.fadeStart === undefined ? crossfadeDuration : fadeEnd - mix.fadeStart;
     const progress = (fadeDuration - timeLeft) / fadeDuration;
 
     const { easeIn, easeOut } = getCrossfadeEasing(crossfadeStyle);
