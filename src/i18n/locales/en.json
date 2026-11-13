@@ -1113,6 +1113,7 @@
         "confirmQueueChanges_description": "Ask for confirmation before discarding the current queue",
         "playbackStyle_description": "Select the playback style to use for the audio player",
         "playbackStyle_optionCrossFade": "Crossfade",
+        "playbackStyle_optionAutoMix": "Auto mix",
         "playbackStyle_optionNormal": "Normal",
         "playbackStyle": "Playback style",
         "playButtonBehavior_description": "Sets the default behavior of the play button when adding songs to the queue",

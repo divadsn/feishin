@@ -91,13 +91,13 @@ export const PlayerConfig = () => {
             {
                 component: <CrossfadeStyleConfig />,
                 id: 'crossfadeStyle',
-                isHidden: transitionType !== PlayerStyle.CROSSFADE,
+                isHidden: ![PlayerStyle.AUTO_MIX, PlayerStyle.CROSSFADE].includes(transitionType),
                 label: t('setting.crossfadeStyle'),
             },
             {
                 component: <CrossfadeDurationConfig />,
                 id: 'crossfadeDuration',
-                isHidden: transitionType !== PlayerStyle.CROSSFADE,
+                isHidden: ![PlayerStyle.AUTO_MIX, PlayerStyle.CROSSFADE].includes(transitionType),
                 label: t('setting.crossfadeDuration'),
             },
         ],
@@ -356,6 +356,12 @@ const TransitionTypeConfig = () => {
                     }),
                     value: PlayerStyle.CROSSFADE,
                 },
+                {
+                    label: t('setting.playbackStyle', {
+                        context: 'optionAutoMix',
+                    }),
+                    value: PlayerStyle.AUTO_MIX,
+                },
             ]}
             disabled={playbackSettings.type !== PlayerType.WEB || status === PlayerStatus.PLAYING}
             onChange={(value) => setTransitionType(value as PlayerStyle)}
@@ -384,7 +390,7 @@ const CrossfadeStyleConfig = () => {
             defaultValue={crossfadeStyle}
             disabled={
                 playbackSettings.type !== PlayerType.WEB ||
-                transitionType !== PlayerStyle.CROSSFADE ||
+                ![PlayerStyle.AUTO_MIX, PlayerStyle.CROSSFADE].includes(transitionType) ||
                 status === PlayerStatus.PLAYING
             }
             onChange={(e) => {
@@ -409,7 +415,7 @@ const CrossfadeDurationConfig = () => {
             defaultValue={crossfadeDuration}
             disabled={
                 playbackSettings.type !== PlayerType.WEB ||
-                transitionType !== PlayerStyle.CROSSFADE ||
+                ![PlayerStyle.AUTO_MIX, PlayerStyle.CROSSFADE].includes(transitionType) ||
                 status === PlayerStatus.PLAYING
             }
             marks={[

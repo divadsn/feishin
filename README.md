@@ -126,6 +126,13 @@ services:
 
 ### Configuration
 
+The Web player offers an **Auto mix** playback style in the player settings. It analyzes
+the current and next tracks in advance, so it uses extra bandwidth and memory. Compatible
+beats are aligned with a small tempo adjustment, which is gradually reversed after the
+transition. Tracks that cannot be analyzed or have incompatible tempos use the configured
+crossfade instead. Analysis is limited to tracks under 15 minutes and 48 MiB, and requires
+the server to permit browser access to the audio stream.
+
 1. Upon startup you will be greeted with a prompt to select the path to your MPV binary. If you do not have MPV installed, you can download it [here](https://mpv.io/installation/) or install it using any package manager supported by your OS. After inputting the path, restart the app.
 
 2. After restarting the app, you will be prompted to select a server. Click the `Open menu` button and select `Manage servers`. Click the `Add server` button in the popup and fill out all applicable details. You will need to enter the full URL to your server, including the protocol and port if applicable (e.g. `https://navidrome.my-server.com` or `http://192.168.0.1:4533`).

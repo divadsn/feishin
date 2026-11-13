@@ -151,6 +151,7 @@
         "taglib-wasm": "^1.8.3",
         "validate-color": "^2.2.4",
         "wavesurfer.js": "^7.12.12",
+        "web-audio-beat-detector": "^8.2.39",
         "ws": "^8.22.2",
         "zod": "^3.25.76",
         "zustand": "^5.1.0"
