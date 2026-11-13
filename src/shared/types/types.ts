@@ -153,6 +153,7 @@ export enum PlayerStatus {
 }
 
 export enum PlayerStyle {
+    AUTO_MIX = 'autoMix',
     CROSSFADE = 'crossfade',
     GAPLESS = 'gapless',
 }

@@ -24,6 +24,7 @@ interface WebPlayerEngineProps {
     isTransitioning: boolean;
     loopPlayer1: boolean;
     loopPlayer2: boolean;
+    mixMode: boolean;
     onEndedPlayer1: () => void;
     onEndedPlayer2: () => void;
     onErrorPause: () => void;
@@ -64,6 +65,7 @@ export const WebPlayerEngine = (props: WebPlayerEngineProps) => {
         isTransitioning,
         loopPlayer1,
         loopPlayer2,
+        mixMode,
         onEndedPlayer1,
         onEndedPlayer2,
         onErrorPause,
@@ -344,7 +346,7 @@ export const WebPlayerEngine = (props: WebPlayerEngineProps) => {
                 onReady={handleOnReadyPlayer1}
                 playbackRate={speed || 1}
                 playing={playerNum === 1 && playerStatus === PlayerStatus.PLAYING}
-                progressInterval={isTransitioning ? 10 : 250}
+                progressInterval={isTransitioning ? 10 : mixMode ? 50 : 250}
                 ref={player1Ref}
                 url={src1 || EMPTY_SOURCE}
                 volume={volume1}
@@ -370,7 +372,7 @@ export const WebPlayerEngine = (props: WebPlayerEngineProps) => {
                 onReady={handleOnReadyPlayer2}
                 playbackRate={speed || 1}
                 playing={playerNum === 2 && playerStatus === PlayerStatus.PLAYING}
-                progressInterval={isTransitioning ? 10 : 250}
+                progressInterval={isTransitioning ? 10 : mixMode ? 50 : 250}
                 ref={player2Ref}
                 url={src2 || EMPTY_SOURCE}
                 volume={volume2}

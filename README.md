@@ -126,6 +126,28 @@ services:
 
 ### Configuration
 
+The Web player offers an **Auto mix** playback style in the player settings that blends the
+queue like a DJ mix:
+
+- **Analysis.** Each track's tempo and beat grid, key (Camelot), energy profile, intro and
+  outro are analyzed in the browser and cached in IndexedDB, so a track is only downloaded for
+  analysis once. Tagged BPM and key (`initialkey`/`key`) are used when the server provides them.
+- **Transitions.** Blends start and end on bar boundaries, are tempo-matched (the adjustment is
+  eased out afterwards) and last 8-32 bars depending on the intro and outro, or 4 bars when the
+  keys clash. With web audio enabled, the bass of the incoming track is swapped in halfway and
+  the outgoing track is filtered out. Tracks that cannot be beat-matched get a short blend.
+- **Queue order.** Upcoming tracks are analyzed a few songs ahead and reordered by tempo, key and
+  energy. The current and next track, Up Next items and album runs stay in place, shuffle keeps
+  its order, and moving queue items manually stops reordering until Auto mix is re-enabled.
+  With Auto DJ in song mode, a larger candidate pool is fetched and the best-fitting songs are
+  added.
+- **Tuning.** Reordering, harmonic mixing, energy flow, blend length, maximum tempo adjustment,
+  EQ transitions and the number of tracks analyzed ahead can be adjusted in the player settings.
+
+Analysis uses extra bandwidth and memory. It is limited to tracks under 15 minutes and 48 MiB,
+and requires the server to permit browser access to the audio stream. Crossfade style and
+duration settings apply only to Crossfade mode.
+
 1. Upon startup you will be greeted with a prompt to select the path to your MPV binary. If you do not have MPV installed, you can download it [here](https://mpv.io/installation/) or install it using any package manager supported by your OS. After inputting the path, restart the app.
 
 2. After restarting the app, you will be prompted to select a server. Click the `Open menu` button and select `Manage servers`. Click the `Add server` button in the popup and fill out all applicable details. You will need to enter the full URL to your server, including the protocol and port if applicable (e.g. `https://navidrome.my-server.com` or `http://192.168.0.1:4533`).

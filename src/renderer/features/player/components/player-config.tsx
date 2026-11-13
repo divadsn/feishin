@@ -3,6 +3,7 @@ import { useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { eventEmitter } from '/@/renderer/events/event-emitter';
+import { clearAnalysisCache } from '/@/renderer/features/player/audio-player/utils/auto-mix-analyzer';
 import { usePlayer } from '/@/renderer/features/player/context/player-context';
 import {
     getDefaultAudioDevice,
@@ -19,8 +20,11 @@ import {
     usePlayerSongProperties,
     usePlayerSpeed,
     usePlayerStatus,
+    usePlayerStoreBase,
 } from '/@/renderer/store';
 import {
+    AutoMixSettings,
+    useAutoMixSettings,
     useCombinedLyricsAndVisualizer,
     useMicrotonalPitchControls,
     usePlaybackSettings,
@@ -39,7 +43,9 @@ import { SegmentedControl } from '/@/shared/components/segmented-control/segment
 import { Select } from '/@/shared/components/select/select';
 import { Slider } from '/@/shared/components/slider/slider';
 import { Stack } from '/@/shared/components/stack/stack';
+import { Switch } from '/@/shared/components/switch/switch';
 import { Text } from '/@/shared/components/text/text';
+import { toast } from '/@/shared/components/toast/toast';
 import { CrossfadeStyle, PlayerStatus, PlayerStyle, PlayerType } from '/@/shared/types/types';
 
 const ipc = isElectron() ? window.api.ipc : null;
@@ -100,6 +106,12 @@ export const PlayerConfig = () => {
                 isHidden: transitionType !== PlayerStyle.CROSSFADE,
                 label: t('setting.crossfadeDuration'),
             },
+            ...AUTO_MIX_OPTIONS.map(({ component: Component, id }) => ({
+                component: <Component />,
+                id,
+                isHidden: transitionType !== PlayerStyle.AUTO_MIX,
+                label: t(`setting.${id}`),
+            })),
         ],
         [t, transitionType],
     );
@@ -356,6 +368,12 @@ const TransitionTypeConfig = () => {
                     }),
                     value: PlayerStyle.CROSSFADE,
                 },
+                {
+                    label: t('setting.playbackStyle', {
+                        context: 'optionAutoMix',
+                    }),
+                    value: PlayerStyle.AUTO_MIX,
+                },
             ]}
             disabled={playbackSettings.type !== PlayerType.WEB || status === PlayerStatus.PLAYING}
             onChange={(value) => setTransitionType(value as PlayerStyle)}
@@ -397,6 +415,159 @@ const CrossfadeStyleConfig = () => {
         />
     );
 };
+
+const useSetAutoMix = () => {
+    const { setSettings } = useSettingsStoreActions();
+    return useCallback(
+        <K extends keyof AutoMixSettings>(key: K, value: AutoMixSettings[K]) => {
+            const { playback } = useSettingsStore.getState();
+            setSettings({
+                playback: { ...playback, autoMix: { ...playback.autoMix, [key]: value } },
+            });
+            if (key !== 'eqTransitions' && key !== 'lookahead') {
+                usePlayerStoreBase.getState().reorderUpcomingForAutoMix();
+            }
+        },
+        [setSettings],
+    );
+};
+
+const AutoMixSwitch = ({ setting }: { setting: 'harmonicMixing' | 'reorderQueue' }) => {
+    const value = useAutoMixSettings()[setting];
+    const setAutoMix = useSetAutoMix();
+    return <ListConfigBooleanControl onChange={(v) => setAutoMix(setting, v)} value={value} />;
+};
+
+const AutoMixEqConfig = () => {
+    const { t } = useTranslation();
+    const { autoMix, webAudio } = usePlaybackSettings();
+    const setAutoMix = useSetAutoMix();
+    return (
+        <Group justify="flex-end" w="100%">
+            {!webAudio && (
+                <Text isMuted size="xs">
+                    {t('setting.autoMixEqTransitions_requiresWebAudio')}
+                </Text>
+            )}
+            <Switch
+                checked={webAudio && autoMix.eqTransitions}
+                disabled={!webAudio}
+                onChange={(e) => setAutoMix('eqTransitions', e.currentTarget.checked)}
+            />
+        </Group>
+    );
+};
+
+const AutoMixEnergyFlowConfig = () => {
+    const { t } = useTranslation();
+    const { energyFlow } = useAutoMixSettings();
+    const setAutoMix = useSetAutoMix();
+    return (
+        <Select
+            comboboxProps={{ withinPortal: false }}
+            data={[
+                { label: t('setting.autoMixEnergyFlow_optionSteady'), value: 'steady' },
+                { label: t('setting.autoMixEnergyFlow_optionBuild'), value: 'build' },
+                { label: t('setting.autoMixEnergyFlow_optionFree'), value: 'free' },
+            ]}
+            onChange={(value) => {
+                if (value) setAutoMix('energyFlow', value as AutoMixSettings['energyFlow']);
+            }}
+            value={energyFlow}
+            variant="filled"
+            width="100%"
+        />
+    );
+};
+
+const AutoMixBlendLengthConfig = () => {
+    const { t } = useTranslation();
+    const { blendLength } = useAutoMixSettings();
+    const setAutoMix = useSetAutoMix();
+    return (
+        <Select
+            comboboxProps={{ withinPortal: false }}
+            data={[
+                { label: t('setting.autoMixBlendLength_optionAuto'), value: 'auto' },
+                ...[4, 8, 16, 32].map((bars) => ({
+                    label: t('setting.autoMixBlendLength_optionBars', { count: bars }),
+                    value: String(bars),
+                })),
+            ]}
+            onChange={(value) => {
+                if (value) setAutoMix('blendLength', value === 'auto' ? 'auto' : Number(value));
+            }}
+            value={String(blendLength)}
+            variant="filled"
+            width="100%"
+        />
+    );
+};
+
+const AutoMixTempoConfig = () => {
+    const { maxTempoAdjust } = useAutoMixSettings();
+    const setAutoMix = useSetAutoMix();
+    return (
+        <Slider
+            defaultValue={maxTempoAdjust}
+            label={(value) => `±${value}%`}
+            marks={[0, 4, 8, 12].map((value) => ({ label: `${value}%`, value }))}
+            max={12}
+            min={0}
+            onChangeEnd={(value) => setAutoMix('maxTempoAdjust', value)}
+            w="100%"
+        />
+    );
+};
+
+const AutoMixLookaheadConfig = () => {
+    const { lookahead, reorderQueue } = useAutoMixSettings();
+    const setAutoMix = useSetAutoMix();
+    return (
+        <Slider
+            defaultValue={lookahead}
+            disabled={!reorderQueue}
+            marks={[4, 8, 12, 16, 20].map((value) => ({ label: String(value), value }))}
+            max={20}
+            min={4}
+            onChangeEnd={(value) => setAutoMix('lookahead', value)}
+            w="100%"
+        />
+    );
+};
+
+const AutoMixCacheConfig = () => {
+    const { t } = useTranslation();
+    return (
+        <Group justify="flex-end" w="100%">
+            <Button
+                onClick={async () => {
+                    try {
+                        await clearAnalysisCache();
+                        toast.success({ message: t('setting.clearCacheSuccess') });
+                    } catch (error) {
+                        toast.error({ message: (error as Error).message });
+                    }
+                }}
+                size="compact-sm"
+                variant="default"
+            >
+                {t('setting.autoMixClearCache_button')}
+            </Button>
+        </Group>
+    );
+};
+
+const AUTO_MIX_OPTIONS = [
+    { component: () => <AutoMixSwitch setting="reorderQueue" />, id: 'autoMixReorderQueue' },
+    { component: () => <AutoMixSwitch setting="harmonicMixing" />, id: 'autoMixHarmonicMixing' },
+    { component: AutoMixEnergyFlowConfig, id: 'autoMixEnergyFlow' },
+    { component: AutoMixBlendLengthConfig, id: 'autoMixBlendLength' },
+    { component: AutoMixTempoConfig, id: 'autoMixMaxTempoAdjust' },
+    { component: AutoMixEqConfig, id: 'autoMixEqTransitions' },
+    { component: AutoMixLookaheadConfig, id: 'autoMixLookahead' },
+    { component: AutoMixCacheConfig, id: 'autoMixClearCache' },
+];
 
 const CrossfadeDurationConfig = () => {
     const status = usePlayerStatus();
