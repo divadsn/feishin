@@ -305,6 +305,18 @@ const EqSettingsSchema = z.object({
     preamp: z.number(),
 });
 
+const AutoMixSettingsSchema = z.object({
+    blendLength: z.union([z.literal('auto'), z.number()]),
+    energyFlow: z.enum(['build', 'free', 'steady']),
+    eqTransitions: z.boolean(),
+    harmonicMixing: z.boolean(),
+    lookahead: z.number(),
+    maxTempoAdjust: z.number(),
+    reorderQueue: z.boolean(),
+});
+
+export type AutoMixSettings = z.infer<typeof AutoMixSettingsSchema>;
+
 const CompressorSettingsSchema = z.object({
     attack: z.number(),
     enabled: z.boolean(),
@@ -710,6 +722,7 @@ const PlayerFilterSchema = z.object({
 const PlaybackSettingsSchema = z.object({
     audioDeviceId: z.string().nullable().optional(),
     audioFadeOnStatusChange: z.boolean(),
+    autoMix: AutoMixSettingsSchema,
     compressor: CompressorSettingsSchema,
     equalizer: EqSettingsSchema,
     filters: z.array(PlayerFilterSchema),
@@ -2078,6 +2091,15 @@ const initialState: SettingsState = {
     playback: {
         audioDeviceId: undefined,
         audioFadeOnStatusChange: true,
+        autoMix: {
+            blendLength: 'auto',
+            energyFlow: 'steady',
+            eqTransitions: true,
+            harmonicMixing: true,
+            lookahead: 8,
+            maxTempoAdjust: 8,
+            reorderQueue: true,
+        },
         compressor: {
             attack: 20,
             enabled: false,
@@ -3223,6 +3245,9 @@ export const useShowVisualizerInSidebar = () =>
     useSettingsStore((state) => state.general.showVisualizerInSidebar, shallow);
 
 export const useAutoDJSettings = () => useSettingsStore((store) => store.autoDJ, shallow);
+
+export const useAutoMixSettings = () =>
+    useSettingsStore((store) => store.playback.autoMix, shallow);
 
 export const useVisualizerSettings = () => useSettingsStore((store) => store.visualizer, shallow);
 

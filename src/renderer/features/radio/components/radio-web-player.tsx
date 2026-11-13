@@ -149,6 +149,7 @@ export function RadioWebPlayer() {
             isTransitioning={false}
             loopPlayer1={false}
             loopPlayer2={false}
+            mixMode={false}
             onEndedPlayer1={onEndedPlayer1}
             onEndedPlayer2={() => {}}
             onErrorPause={() => {}}

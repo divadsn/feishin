@@ -7,6 +7,11 @@ import { useShallow } from 'zustand/react/shallow';
 import { createWithEqualityFn } from 'zustand/traditional';
 
 import { eventEmitter } from '/@/renderer/events/event-emitter';
+import { orderForMix } from '/@/renderer/features/player/audio-player/utils/auto-mix';
+import {
+    getMixCandidate,
+    getMixFeatures,
+} from '/@/renderer/features/player/audio-player/utils/auto-mix-analyzer';
 import { useRadioStore as useRadioPlayerStore } from '/@/renderer/features/radio/hooks/use-radio-player';
 import { createSelectors } from '/@/renderer/lib/zustand';
 import { useSettingsStore } from '/@/renderer/store/settings.store';
@@ -70,6 +75,8 @@ interface Actions {
     moveSelectedToBottom: (items: QueueSong[]) => void;
     moveSelectedToNext: (items: QueueSong[]) => void;
     moveSelectedToTop: (items: QueueSong[]) => void;
+    /** Reorders upcoming songs for a smooth auto mix; a no-op after manual queue edits. */
+    reorderUpcomingForAutoMix: () => void;
     setCrossfadeDuration: (duration: number) => void;
     setCrossfadeStyle: (style: CrossfadeStyle) => void;
     setPauseOnNextSongEnd: (value: boolean) => void;
@@ -86,12 +93,16 @@ interface Actions {
     toggleShuffle: () => void;
 }
 
+const AUTO_MIX_REORDER_LIMIT = 100;
+
 interface GroupedQueue {
     groups: { count: number; name: string }[];
     items: QueueSong[];
 }
 
 interface State {
+    // Runtime-only: set by manual queue moves so auto mix stops reordering the user's order.
+    autoMixOrderLocked: boolean;
     hydrated: boolean;
     // Runtime-only: true once the mpv engine has finished initializing.
     // Top-level keys are not persisted (see partialize), same as `hydrated`.
@@ -475,6 +486,7 @@ function syncUpNext(state: Pick<State, 'player' | 'queue'>): void {
 }
 
 const initialState: State = {
+    autoMixOrderLocked: false,
     hydrated: false,
     mpvInitialized: false,
     player: {
@@ -1586,6 +1598,7 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     const itemUniqueIds = items.map((item) => item._uniqueId);
 
                     set((state) => {
+                        state.autoMixOrderLocked = true;
                         const currentId = get().getCurrentSong()?._uniqueId;
 
                         // Find the index of the drop target
@@ -1626,6 +1639,7 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                 },
                 moveSelectedToBottom: (items: QueueSong[]) => {
                     set((state) => {
+                        state.autoMixOrderLocked = true;
                         const uniqueIds = items.map((item) => item._uniqueId);
 
                         // Add new songs to songs object
@@ -1647,6 +1661,7 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                 },
                 moveSelectedToNext: (items: QueueSong[]) => {
                     set((state) => {
+                        state.autoMixOrderLocked = true;
                         const uniqueIds = items.map((item) => item._uniqueId);
 
                         // Add new songs to songs object
@@ -1688,6 +1703,7 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                 },
                 moveSelectedToTop: (items: QueueSong[]) => {
                     set((state) => {
+                        state.autoMixOrderLocked = true;
                         const uniqueIds = items.map((item) => item._uniqueId);
 
                         // Add new songs to songs object
@@ -1730,6 +1746,74 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 ...initialState,
+                reorderUpcomingForAutoMix: () => {
+                    const settings = useSettingsStore.getState().playback.autoMix;
+                    set((state) => {
+                        if (
+                            state.autoMixOrderLocked ||
+                            !settings.reorderQueue ||
+                            state.player.transitionType !== PlayerStyle.AUTO_MIX ||
+                            isShuffleEnabled(state)
+                        ) {
+                            return;
+                        }
+
+                        const { songs } = state.queue;
+                        const currentIndex = state.player.index;
+                        const currentId = state.queue.default[currentIndex];
+                        if (!currentId) return;
+
+                        // Everything through the Up Next block and the next song (already loaded
+                        // in the other deck) stay put, together with the rest of the album that
+                        // is playing or about to play.
+                        const priority = new Set(state.queue.priority);
+                        const upcoming = state.queue.default.slice(currentIndex + 1);
+                        let fixedCount = 1;
+                        upcoming.forEach((id, index) => {
+                            if (priority.has(id)) fixedCount = Math.max(fixedCount, index + 1);
+                        });
+                        const fixed = upcoming.slice(0, fixedCount);
+                        // Greedy ordering is quadratic, so only the near future is reordered.
+                        const rest = upcoming.slice(
+                            fixedCount,
+                            fixedCount + AUTO_MIX_REORDER_LIMIT,
+                        );
+                        const tail = upcoming.slice(fixedCount + AUTO_MIX_REORDER_LIMIT);
+                        const anchorAlbum = songs[fixed[fixed.length - 1] ?? currentId]?.albumId;
+                        while (
+                            anchorAlbum &&
+                            rest.length &&
+                            songs[rest[0]]?.albumId === anchorAlbum
+                        ) {
+                            fixed.push(rest.shift() as string);
+                        }
+                        if (rest.length < 2) return;
+
+                        const last = songs[fixed[fixed.length - 1] ?? currentId];
+                        const candidates = rest
+                            .filter((id) => songs[id])
+                            .map((id) => getMixCandidate(songs[id]));
+                        const sorted = orderForMix(
+                            candidates,
+                            last ? getMixFeatures(last) : null,
+                            settings,
+                        ).map((candidate) => candidate.id);
+                        if (
+                            sorted.length !== rest.length ||
+                            sorted.every((id, i) => id === rest[i])
+                        ) {
+                            return;
+                        }
+
+                        state.queue.default = [
+                            ...state.queue.default.slice(0, currentIndex + 1),
+                            ...fixed,
+                            ...sorted,
+                            ...tail,
+                        ];
+                        syncUpNext(state);
+                    });
+                },
                 setCrossfadeDuration: (duration: number) => {
                     set((state) => {
                         const normalizedDuration = Math.max(3, Math.min(21, duration));
@@ -1800,9 +1884,14 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 setTransitionType: (transitionType: PlayerStyle) => {
+                    const enablingAutoMix =
+                        transitionType === PlayerStyle.AUTO_MIX &&
+                        get().player.transitionType !== PlayerStyle.AUTO_MIX;
                     set((state) => {
                         state.player.transitionType = transitionType;
+                        if (enablingAutoMix) state.autoMixOrderLocked = false;
                     });
+                    if (enablingAutoMix) get().reorderUpcomingForAutoMix();
                 },
                 setVolume: (volume: number) => {
                     set((state) => {

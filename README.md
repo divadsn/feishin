@@ -126,12 +126,27 @@ services:
 
 ### Configuration
 
-The Web player offers an **Auto mix** playback style in the player settings. It analyzes
-the current and next tracks in advance, so it uses extra bandwidth and memory. Compatible
-beats are aligned with a small tempo adjustment, which is gradually reversed after the
-transition. Tracks that cannot be analyzed or have incompatible tempos use the configured
-crossfade instead. Analysis is limited to tracks under 15 minutes and 48 MiB, and requires
-the server to permit browser access to the audio stream.
+The Web player offers an **Auto mix** playback style in the player settings that blends the
+queue like a DJ mix:
+
+- **Analysis.** Each track's tempo and beat grid, key (Camelot), energy profile, intro and
+  outro are analyzed in the browser and cached in IndexedDB, so a track is only downloaded for
+  analysis once. Tagged BPM and key (`initialkey`/`key`) are used when the server provides them.
+- **Transitions.** Blends start and end on bar boundaries, are tempo-matched (the adjustment is
+  eased out afterwards) and last 8-32 bars depending on the intro and outro, or 4 bars when the
+  keys clash. With web audio enabled, the bass of the incoming track is swapped in halfway and
+  the outgoing track is filtered out. Tracks that cannot be beat-matched get a short blend.
+- **Queue order.** Upcoming tracks are analyzed a few songs ahead and reordered by tempo, key and
+  energy. The current and next track, Up Next items and album runs stay in place, shuffle keeps
+  its order, and moving queue items manually stops reordering until Auto mix is re-enabled.
+  With Auto DJ in song mode, a larger candidate pool is fetched and the best-fitting songs are
+  added.
+- **Tuning.** Reordering, harmonic mixing, energy flow, blend length, maximum tempo adjustment,
+  EQ transitions and the number of tracks analyzed ahead can be adjusted in the player settings.
+
+Analysis uses extra bandwidth and memory. It is limited to tracks under 15 minutes and 48 MiB,
+and requires the server to permit browser access to the audio stream. Crossfade style and
+duration settings apply only to Crossfade mode.
 
 1. Upon startup you will be greeted with a prompt to select the path to your MPV binary. If you do not have MPV installed, you can download it [here](https://mpv.io/installation/) or install it using any package manager supported by your OS. After inputting the path, restart the app.
 

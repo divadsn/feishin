@@ -2,6 +2,14 @@ import { useQueryClient } from '@tanstack/react-query';
 import React, { useEffect } from 'react';
 
 import { eventEmitter } from '/@/renderer/events/event-emitter';
+import {
+    AutoMixOptions,
+    pickForMix,
+} from '/@/renderer/features/player/audio-player/utils/auto-mix';
+import {
+    getMixFeatures,
+    loadCachedAnalyses,
+} from '/@/renderer/features/player/audio-player/utils/auto-mix-analyzer';
 import { runAutoDjAlbumIds } from '/@/renderer/features/player/auto-dj/auto-dj-albums';
 import { runAutoDjSongs } from '/@/renderer/features/player/auto-dj/auto-dj-songs';
 import { useIsPlayerFetching, usePlayer } from '/@/renderer/features/player/context/player-context';
@@ -18,9 +26,32 @@ import {
 } from '/@/renderer/store';
 import { logger } from '/@/renderer/utils/logger';
 import { hasFeature } from '/@/shared/api/utils';
-import { LibraryItem } from '/@/shared/types/domain-types';
+import { LibraryItem, Song } from '/@/shared/types/domain-types';
 import { ServerFeature } from '/@/shared/types/features-types';
-import { Play } from '/@/shared/types/types';
+import { Play, PlayerStyle } from '/@/shared/types/types';
+
+const AUTO_MIX_CANDIDATE_FACTOR = 3;
+
+async function pickSongsForMix(
+    candidates: Song[],
+    last: Song | undefined,
+    count: number,
+    options: AutoMixOptions,
+): Promise<Song[]> {
+    await loadCachedAnalyses(last ? [...candidates, last] : candidates);
+    const byId = new Map(candidates.map((song) => [song.id, song]));
+    const picked = pickForMix(
+        candidates.map((song) => ({ ...getMixFeatures(song), id: song.id })),
+        last ? getMixFeatures(last) : null,
+        count,
+        options,
+    );
+    logger.info('Auto DJ picked songs for auto mix', {
+        candidates: candidates.length,
+        picked: picked.length,
+    });
+    return picked.map((candidate) => byId.get(candidate.id)).filter((song) => song !== undefined);
+}
 
 export const useAutoDJ = () => {
     const queryClient = useQueryClient();
@@ -130,12 +161,32 @@ export const useAutoDJ = () => {
 
                     const queueSongIdSet = new Set(queue.items.map((item) => item.id));
 
-                    const songsToAdd = await runAutoDjSongs({
+                    // With auto mix, fetch a larger pool and keep the songs that mix best
+                    // from the end of the queue.
+                    const { playback } = useSettingsStore.getState();
+                    const mixAware =
+                        playback.autoMix.reorderQueue &&
+                        usePlayerStoreBase.getState().player.transitionType ===
+                            PlayerStyle.AUTO_MIX;
+
+                    const candidates = await runAutoDjSongs({
                         ...runnerDepsBase,
                         currentSong: properties.song,
+                        itemCount: mixAware
+                            ? settings.itemCount * AUTO_MIX_CANDIDATE_FACTOR
+                            : settings.itemCount,
                         queueSongIdSet,
                         songStrategy,
                     });
+
+                    const songsToAdd = mixAware
+                        ? await pickSongsForMix(
+                              candidates,
+                              queue.items[queue.items.length - 1],
+                              settings.itemCount,
+                              playback.autoMix,
+                          )
+                        : candidates;
 
                     if (songsToAdd.length > 0) {
                         player.addToQueueByData(songsToAdd, Play.LAST);
