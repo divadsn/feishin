@@ -1797,6 +1797,7 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                             candidates,
                             last ? getMixFeatures(last) : null,
                             settings,
+                            currentIndex + 1 + fixed.length,
                         ).map((candidate) => candidate.id);
                         if (
                             sorted.length !== rest.length ||

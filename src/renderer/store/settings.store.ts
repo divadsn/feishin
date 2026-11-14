@@ -307,7 +307,7 @@ const EqSettingsSchema = z.object({
 
 const AutoMixSettingsSchema = z.object({
     blendLength: z.union([z.literal('auto'), z.number()]),
-    energyFlow: z.enum(['build', 'free', 'steady']),
+    energyFlow: z.enum(['auto', 'build', 'free', 'steady']),
     eqTransitions: z.boolean(),
     harmonicMixing: z.boolean(),
     lookahead: z.number(),
@@ -2093,7 +2093,7 @@ const initialState: SettingsState = {
         audioFadeOnStatusChange: true,
         autoMix: {
             blendLength: 'auto',
-            energyFlow: 'steady',
+            energyFlow: 'auto',
             eqTransitions: true,
             harmonicMixing: true,
             lookahead: 8,

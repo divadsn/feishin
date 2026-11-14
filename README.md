@@ -132,12 +132,18 @@ queue like a DJ mix:
 - **Analysis.** Each track's tempo and beat grid, key (Camelot), energy profile, intro and
   outro are analyzed in the browser and cached in IndexedDB, so a track is only downloaded for
   analysis once. Tagged BPM and key (`initialkey`/`key`) are used when the server provides them.
-- **Transitions.** Blends start and end on bar boundaries, are tempo-matched (the adjustment is
-  eased out afterwards) and last 8-32 bars depending on the intro and outro, or 4 bars when the
-  keys clash. With web audio enabled, the bass of the incoming track is swapped in halfway and
-  the outgoing track is filtered out. Tracks that cannot be beat-matched get a short blend.
+- **Transitions.** Blends are placed to keep the energy up, like a DJ mixing out: a quiet
+  incoming intro goes under the outgoing track's last loud phrase (up to a minute before its
+  outro) so the drop lands where it would break down, while a track that starts loud is mixed
+  late into the outro. They are tempo-matched and kept on the beat (the adjustment is eased out
+  afterwards), last 8-32 bars depending on the intro and outro (4 bars when the keys clash), and
+  the incoming drop is lined up with the end of the blend. With web audio enabled, the incoming
+  track comes in early with its bass cut, both play at full, the bass is swapped at the halfway
+  phrase (or at the drop) and the outgoing track is filtered out. Tracks that cannot be
+  beat-matched get an echo-out on a downbeat, or a short blend without web audio.
 - **Queue order.** Upcoming tracks are analyzed a few songs ahead and reordered by tempo, key and
-  energy. The current and next track, Up Next items and album runs stay in place, shuffle keeps
+  energy. The Auto energy flow follows a DJ set arc: a warm-up build, then a held peak with a
+  short breather and a new build every 16 tracks. The current and next track, Up Next items and album runs stay in place, shuffle keeps
   its order, and moving queue items manually stops reordering until Auto mix is re-enabled.
   With Auto DJ in song mode, a larger candidate pool is fetched and the best-fitting songs are
   added.

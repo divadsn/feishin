@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+    arcFlow,
     camelotDistance,
     DEFAULT_AUTO_MIX_OPTIONS,
     estimateKey,
@@ -10,11 +11,14 @@ import {
     findOutroStart,
     getAudibleRange,
     getEnergyProfile,
+    mixGains,
     orderForMix,
     parseKeyTag,
     pickForMix,
+    planEchoOut,
     planMix,
     shouldSkipAutoMixAfterSeek,
+    syncPlaybackRate,
 } from '../src/renderer/features/player/audio-player/utils/auto-mix.ts';
 
 // 8-bar intro and outro at 120 BPM unless overridden.
@@ -40,7 +44,8 @@ test('aligns a phrase-length transition and adjusts tempo', () => {
     assert.ok(plan);
     assert.equal(plan.rate, 120 / 125);
     assert.equal(plan.fadeEnd, 180);
-    assert.equal(plan.incomingStart, 0.2);
+    // Drop (intro end, ~9 bars in) lands at the end of the 8-bar blend.
+    assert.equal(plan.incomingStart, 0.2 + (60 / 125) * 4);
     assert.ok(plan.fadeDuration >= 15 && plan.fadeDuration <= 17);
     const outgoingBars = (plan.start - outgoing.end.offset) / 2;
     assert.ok(Math.abs(outgoingBars - Math.round(outgoingBars)) < 1e-9);
@@ -51,12 +56,87 @@ test('handles half-time BPM and user playback speed', () => {
     assert.deepEqual(plan, {
         bars: 8,
         bassSwapAt: 92,
+        beat: 0.5,
         fadeDuration: 16,
         fadeEnd: 100,
-        incomingStart: 0,
+        // 10-bar intro at 60 BPM, 8-bar blend: start 2 bars in so the drop lands at the end.
+        incomingStart: 8,
         rate: 1.5,
         start: 84,
+        style: 'blend',
     });
+});
+
+test('mixes out at the outro phrase and skips the tail', () => {
+    const outgoing = track(120, 0, 0, 240, { outroStart: 176 });
+    const incoming = track(120, 0, 0, 240, { introEnd: 16 });
+    const plan = planMix(outgoing, incoming, 240, 1);
+    assert.equal(plan.start, 176);
+    assert.equal(plan.bars, 8);
+    assert.equal(plan.fadeEnd, 192);
+    assert.equal(plan.incomingStart, 0);
+    assert.equal(plan.bassSwapAt, 184);
+});
+
+test('blends into the tail when the outro is too short', () => {
+    const plan = planMix(
+        track(120, 0, 0, 180, { outroStart: 176 }),
+        track(120, 0, 0, 180, { introEnd: 16 }),
+        180,
+        1,
+    );
+    assert.equal(plan.fadeEnd, 180);
+    assert.equal(plan.start, 164);
+});
+
+test('swaps the bass at the incoming drop when the intro is short', () => {
+    const plan = planMix(
+        track(120, 0, 0, 240, { outroStart: 176 }),
+        track(120, 0, 0, 240, { introEnd: 4 }),
+        240,
+        1,
+        options({ blendLength: 8 }),
+    );
+    assert.equal(plan.incomingStart, 0);
+    assert.equal(plan.bassSwapAt, 180);
+});
+
+test('shapes DJ gains: incoming up early, outgoing out after the swap', () => {
+    const plan = planMix(
+        track(120, 0, 0, 240, { outroStart: 176 }),
+        track(120, 0, 0, 240, { introEnd: 16 }),
+        240,
+        1,
+    );
+    assert.deepEqual(mixGains(plan, 176), { incoming: 0, outgoing: 1 });
+    const middle = mixGains(plan, 182);
+    assert.equal(middle.incoming, 1);
+    assert.equal(middle.outgoing, 1);
+    const late = mixGains(plan, 190);
+    assert.ok(late.outgoing < 0.5 && late.incoming === 1);
+    assert.ok(mixGains(plan, 192).outgoing < 1e-9);
+});
+
+test('plans an echo-out on a downbeat for unmatched tempos', () => {
+    const outgoing = track(120, 0.1, 0, 200, { outroStart: 170.1 });
+    const incoming = track(90, 0.3, 1, 200);
+    assert.equal(planMix(outgoing, incoming, 200, 1), null);
+    const plan = planEchoOut(outgoing, incoming, 200, 1);
+    assert.equal(plan.style, 'echo');
+    assert.equal(plan.start, 170.1);
+    assert.equal(plan.fadeEnd, 170.6);
+    assert.equal(plan.rate, 1);
+    assert.ok(Math.abs(plan.incomingStart - (0.3 + (60 / 90) * 4)) < 1e-9);
+    assert.deepEqual(mixGains(plan, 170.1), { incoming: 1, outgoing: 1 });
+    assert.equal(planEchoOut(track(0, 0, 0, 200), incoming, 200, 1), null);
+});
+
+test('nudges the incoming deck back onto the beat', () => {
+    assert.equal(syncPlaybackRate(0.005, 1), 1);
+    assert.ok(syncPlaybackRate(0.05, 1) < 1);
+    assert.ok(syncPlaybackRate(-0.05, 1) > 1);
+    assert.ok(syncPlaybackRate(0.09, 1) >= 0.97);
+    assert.equal(syncPlaybackRate(0.5, 1), null);
 });
 
 test('does not beatmatch incompatible or invalid tracks', () => {
@@ -265,4 +345,71 @@ test('skips the scheduled mix when seeking into its transition window', () => {
     assert.equal(shouldSkipAutoMixAfterSeek(plan.start - 1, 180, plan, 8), false);
     assert.equal(shouldSkipAutoMixAfterSeek(plan.start, 180, plan, 8), true);
     assert.equal(shouldSkipAutoMixAfterSeek(172, 180, null, 8), true);
+});
+
+const energyCurve = (length, quiet) =>
+    Array.from({ length }, (_, second) => (quiet(second) ? 0.2 : 1));
+
+test('mixes out a phrase before a quiet outro to keep the energy up', () => {
+    const outgoing = track(120, 0, 0, 240, {
+        energy: energyCurve(240, (second) => second >= 176),
+        outroStart: 176,
+    });
+    const incoming = track(120, 0, 0, 240, {
+        energy: energyCurve(240, (second) => second < 16),
+        introEnd: 16,
+    });
+    const plan = planMix(outgoing, incoming, 240, 1);
+    // The incoming drop now lands where the outgoing breaks down.
+    assert.equal(plan.start, 160);
+    assert.equal(plan.fadeEnd, 176);
+});
+
+test('mixes late into the outro when the incoming track starts loud', () => {
+    const outgoing = track(120, 0, 0, 240, {
+        energy: energyCurve(240, (second) => second >= 176),
+        outroStart: 176,
+    });
+    const incoming = track(120, 0, 0, 240, { energy: energyCurve(240, () => false), introEnd: 0 });
+    const plan = planMix(outgoing, incoming, 240, 1);
+    assert.equal(plan.start, 224);
+    assert.equal(plan.fadeEnd, 240);
+});
+
+test('never mixes out more than a minute before the outro', () => {
+    const outgoing = track(120, 0, 0, 300, {
+        energy: energyCurve(300, (second) => second >= 100),
+        outroStart: 236,
+    });
+    const incoming = track(120, 0, 0, 300, {
+        energy: energyCurve(300, (second) => second < 16),
+        introEnd: 16,
+    });
+    const plan = planMix(outgoing, incoming, 300, 1);
+    assert.ok(plan.fadeEnd >= 236 - 60, `fadeEnd ${plan.fadeEnd}`);
+});
+
+test('keeps the outro mix point without energy profiles', () => {
+    const plan = planMix(
+        track(120, 0, 0, 240, { outroStart: 176 }),
+        track(120, 0, 0, 240, { introEnd: 16 }),
+        240,
+        1,
+    );
+    assert.equal(plan.start, 176);
+});
+
+test('follows a DJ set arc with the auto energy flow', () => {
+    assert.equal(arcFlow(0), 'build');
+    assert.equal(arcFlow(7), 'build');
+    assert.equal(arcFlow(8), 'steady');
+    assert.equal(arcFlow(18), 'release');
+    assert.equal(arcFlow(20), 'build');
+    assert.equal(arcFlow(24), 'steady');
+
+    const tracks = [feat('down', 120, null, 0.3), feat('up', 120, null, 0.6)];
+    const current = feat('current', 120, null, 0.45);
+    const auto = options({ energyFlow: 'auto' });
+    assert.equal(orderForMix(tracks, current, auto, 0)[0].id, 'up');
+    assert.equal(orderForMix(tracks, current, auto, 18)[0].id, 'down');
 });

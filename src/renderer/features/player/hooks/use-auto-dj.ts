@@ -37,6 +37,7 @@ async function pickSongsForMix(
     last: Song | undefined,
     count: number,
     options: AutoMixOptions,
+    position: number,
 ): Promise<Song[]> {
     await loadCachedAnalyses(last ? [...candidates, last] : candidates);
     const byId = new Map(candidates.map((song) => [song.id, song]));
@@ -45,6 +46,7 @@ async function pickSongsForMix(
         last ? getMixFeatures(last) : null,
         count,
         options,
+        position,
     );
     logger.info('Auto DJ picked songs for auto mix', {
         candidates: candidates.length,
@@ -185,6 +187,7 @@ export const useAutoDJ = () => {
                               queue.items[queue.items.length - 1],
                               settings.itemCount,
                               playback.autoMix,
+                              queue.items.length,
                           )
                         : candidates;
 

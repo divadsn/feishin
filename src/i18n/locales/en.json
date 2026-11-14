@@ -899,6 +899,7 @@
         "autoMixClearCache": "Auto mix analysis cache",
         "autoMixClearCache_button": "Clear",
         "autoMixEnergyFlow": "Auto mix energy flow",
+        "autoMixEnergyFlow_optionAuto": "Auto (DJ set arc)",
         "autoMixEnergyFlow_optionBuild": "Build up",
         "autoMixEnergyFlow_optionFree": "Ignore energy",
         "autoMixEnergyFlow_optionSteady": "Keep steady",

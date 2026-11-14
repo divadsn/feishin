@@ -17,9 +17,13 @@ import { usePlayerEvents } from '/@/renderer/features/player/audio-player/hooks/
 import { useSongUrl } from '/@/renderer/features/player/audio-player/hooks/use-stream-url';
 import { PlayerOnProgressProps } from '/@/renderer/features/player/audio-player/types';
 import {
+    mixGains,
     MixPlan,
+    planEchoOut,
     planMix,
     shouldSkipAutoMixAfterSeek,
+    syncPlaybackRate,
+    TrackAnalysis,
 } from '/@/renderer/features/player/audio-player/utils/auto-mix';
 import {
     connectDeckFx,
@@ -51,6 +55,27 @@ const PLAY_PAUSE_FADE_DURATION = 300;
 const PLAY_PAUSE_FADE_INTERVAL = 10;
 const AUTO_MIX_FALLBACK_FADE_DURATION = 8;
 
+interface MixHandlers {
+    /** Deck EQ is available, so both decks can play at full while the bass is swapped. */
+    djGains: boolean;
+    fadeStart: number | undefined;
+    nextId: string | undefined;
+    onCancel: () => void;
+    onError: (incoming: HTMLMediaElement) => void;
+    /** Hands over to the next track when the plan mixes out before the track ends. */
+    onFinished: () => void;
+    onPlaying: (incoming: HTMLMediaElement) => void;
+    onStarted: (
+        incoming: HTMLMediaElement,
+        fadeStart: number,
+        rate: number,
+        nextId: string,
+    ) => void;
+    onSync: (drift: number, seeked: boolean) => void;
+    plan: MixPlan | null;
+    speed: number;
+}
+
 export function WebPlayer() {
     const playerRef = useRef<null | WebPlayerEngineHandle>(null);
     const { t } = useTranslation();
@@ -79,9 +104,12 @@ export function WebPlayer() {
         fadeStart: number;
         handedOff: boolean;
         incoming: HTMLMediaElement;
+        maxDrift: number;
         nextId: string;
         outgoing: 1 | 2;
         rate: number;
+        seeks: number;
+        style: MixPlan['style'] | null;
     }>(null);
     const mixRampRef = useRef<null | ReturnType<typeof setInterval>>(null);
     const mixHandoffRef = useRef(false);
@@ -137,6 +165,12 @@ export function WebPlayer() {
             ) {
                 cancelMix();
                 return;
+            }
+            if (mix.style === 'blend') {
+                logger.debug('Auto mix beat sync', {
+                    maxDriftMs: Math.round(mix.maxDrift * 1000),
+                    seeks: mix.seeks,
+                });
             }
             mix.handedOff = true;
             resetDeckFx(deckFxRef.current[0]);
@@ -248,240 +282,6 @@ export function WebPlayer() {
         [num, repeat, setTimestamp],
     );
 
-    const onProgressPlayer1 = useCallback(
-        (e: PlayerOnProgressProps) => {
-            if (!playerRef.current?.player1()) {
-                return;
-            }
-
-            if (usePlayerStoreBase.getState().player.status !== PlayerStatus.PLAYING) {
-                return;
-            }
-
-            if (num === 1) {
-                setTimestamp(e.playedSeconds);
-            }
-
-            if (repeat === PlayerRepeat.ONE) {
-                handleRepeatOne(1, e.playedSeconds, getDuration(playerRef.current.player1().ref));
-                return;
-            }
-            if (transitionType === PlayerStyle.AUTO_MIX && skipAutoMixForTrackRef.current) return;
-
-            const currentDuration = getDuration(playerRef.current.player1().ref);
-            const outgoingAnalysis = num === 1 ? analysis1 : analysis2;
-            const incomingAnalysis = num === 1 ? analysis2 : analysis1;
-            const autoMixPlan =
-                transitionType === PlayerStyle.AUTO_MIX && outgoingAnalysis && incomingAnalysis
-                    ? planMix(outgoingAnalysis, incomingAnalysis, currentDuration, speed, autoMix)
-                    : null;
-            const fadeDuration =
-                transitionType === PlayerStyle.AUTO_MIX
-                    ? (autoMixPlan?.fadeDuration ?? AUTO_MIX_FALLBACK_FADE_DURATION)
-                    : crossfadeDuration;
-
-            switch (transitionType) {
-                case PlayerStyle.AUTO_MIX:
-                case PlayerStyle.CROSSFADE:
-                    crossfadeHandler({
-                        crossfadeDuration: fadeDuration,
-                        crossfadeStyle:
-                            transitionType === PlayerStyle.AUTO_MIX
-                                ? CrossfadeStyle.EQUAL_POWER
-                                : crossfadeStyle,
-                        currentPlayer: playerRef.current.player1(),
-                        currentPlayerNum: num,
-                        currentTime: e.playedSeconds,
-                        duration: currentDuration,
-                        hasNextSong: Boolean(player2),
-                        isTransitioning,
-                        mix:
-                            transitionType === PlayerStyle.AUTO_MIX
-                                ? {
-                                      fadeStart: mixRef.current?.fadeStart,
-                                      nextId: player2?._uniqueId,
-                                      onCancel: cancelMix,
-                                      onError: (incoming) => {
-                                          if (mixRef.current?.incoming === incoming) mediaPause();
-                                      },
-                                      onPlaying: (incoming) => {
-                                          if (mixRef.current?.incoming === incoming) {
-                                              incoming.playbackRate = mixRef.current.rate;
-                                          }
-                                      },
-                                      onStarted: (incoming, fadeStart, rate, nextId) => {
-                                          if (mixRef.current?.handedOff) cancelMix();
-                                          mixRef.current = {
-                                              fadeStart,
-                                              handedOff: false,
-                                              incoming,
-                                              nextId,
-                                              outgoing: 1,
-                                              rate,
-                                          };
-                                          scheduleFx(1, autoMixPlan, fadeStart, fadeDuration);
-                                      },
-                                      plan: autoMixPlan,
-                                      speed,
-                                  }
-                                : undefined,
-                        nextPlayer: playerRef.current.player2(),
-                        playerNum: 1,
-                        setIsTransitioning,
-                        volume,
-                    });
-                    break;
-                case PlayerStyle.GAPLESS:
-                    gaplessHandler({
-                        currentTime: e.playedSeconds,
-                        duration: getDuration(playerRef.current.player1().ref),
-                        hasNextSong: Boolean(player2),
-                        isFlac: false,
-                        isTransitioning,
-                        nextPlayer: playerRef.current.player2(),
-                        setIsTransitioning,
-                    });
-                    break;
-            }
-        },
-        [
-            crossfadeDuration,
-            crossfadeStyle,
-            analysis1,
-            analysis2,
-            autoMix,
-            cancelMix,
-            handleRepeatOne,
-            isTransitioning,
-            mediaPause,
-            num,
-            player2,
-            scheduleFx,
-            repeat,
-            speed,
-            setTimestamp,
-            transitionType,
-            volume,
-        ],
-    );
-
-    const onProgressPlayer2 = useCallback(
-        (e: PlayerOnProgressProps) => {
-            if (!playerRef.current?.player2()) {
-                return;
-            }
-
-            if (usePlayerStoreBase.getState().player.status !== PlayerStatus.PLAYING) {
-                return;
-            }
-
-            if (num === 2) {
-                setTimestamp(e.playedSeconds);
-            }
-
-            if (repeat === PlayerRepeat.ONE) {
-                handleRepeatOne(2, e.playedSeconds, getDuration(playerRef.current.player2().ref));
-                return;
-            }
-            if (transitionType === PlayerStyle.AUTO_MIX && skipAutoMixForTrackRef.current) return;
-
-            const currentDuration = getDuration(playerRef.current.player2().ref);
-            const outgoingAnalysis = num === 2 ? analysis2 : analysis1;
-            const incomingAnalysis = num === 2 ? analysis1 : analysis2;
-            const autoMixPlan =
-                transitionType === PlayerStyle.AUTO_MIX && outgoingAnalysis && incomingAnalysis
-                    ? planMix(outgoingAnalysis, incomingAnalysis, currentDuration, speed, autoMix)
-                    : null;
-            const fadeDuration =
-                transitionType === PlayerStyle.AUTO_MIX
-                    ? (autoMixPlan?.fadeDuration ?? AUTO_MIX_FALLBACK_FADE_DURATION)
-                    : crossfadeDuration;
-
-            switch (transitionType) {
-                case PlayerStyle.AUTO_MIX:
-                case PlayerStyle.CROSSFADE:
-                    crossfadeHandler({
-                        crossfadeDuration: fadeDuration,
-                        crossfadeStyle:
-                            transitionType === PlayerStyle.AUTO_MIX
-                                ? CrossfadeStyle.EQUAL_POWER
-                                : crossfadeStyle,
-                        currentPlayer: playerRef.current.player2(),
-                        currentPlayerNum: num,
-                        currentTime: e.playedSeconds,
-                        duration: currentDuration,
-                        hasNextSong: Boolean(player1),
-                        isTransitioning,
-                        mix:
-                            transitionType === PlayerStyle.AUTO_MIX
-                                ? {
-                                      fadeStart: mixRef.current?.fadeStart,
-                                      nextId: player1?._uniqueId,
-                                      onCancel: cancelMix,
-                                      onError: (incoming) => {
-                                          if (mixRef.current?.incoming === incoming) mediaPause();
-                                      },
-                                      onPlaying: (incoming) => {
-                                          if (mixRef.current?.incoming === incoming) {
-                                              incoming.playbackRate = mixRef.current.rate;
-                                          }
-                                      },
-                                      onStarted: (incoming, fadeStart, rate, nextId) => {
-                                          if (mixRef.current?.handedOff) cancelMix();
-                                          mixRef.current = {
-                                              fadeStart,
-                                              handedOff: false,
-                                              incoming,
-                                              nextId,
-                                              outgoing: 2,
-                                              rate,
-                                          };
-                                          scheduleFx(2, autoMixPlan, fadeStart, fadeDuration);
-                                      },
-                                      plan: autoMixPlan,
-                                      speed,
-                                  }
-                                : undefined,
-                        nextPlayer: playerRef.current.player1(),
-                        playerNum: 2,
-                        setIsTransitioning,
-                        volume,
-                    });
-                    break;
-                case PlayerStyle.GAPLESS:
-                    gaplessHandler({
-                        currentTime: e.playedSeconds,
-                        duration: getDuration(playerRef.current.player2().ref),
-                        hasNextSong: Boolean(player1),
-                        isFlac: false,
-                        isTransitioning,
-                        nextPlayer: playerRef.current.player1(),
-                        setIsTransitioning,
-                    });
-                    break;
-            }
-        },
-        [
-            crossfadeDuration,
-            crossfadeStyle,
-            analysis1,
-            analysis2,
-            autoMix,
-            cancelMix,
-            handleRepeatOne,
-            isTransitioning,
-            mediaPause,
-            num,
-            player1,
-            scheduleFx,
-            repeat,
-            speed,
-            setTimestamp,
-            transitionType,
-            volume,
-        ],
-    );
-
     const handleOnEndedPlayer1 = useCallback(() => {
         mixHandoffRef.current = true;
         mediaAutoNext();
@@ -527,6 +327,191 @@ export function WebPlayer() {
         }
     }, [finishMix, mediaAutoNext, volume]);
 
+    const hasMixFx = useCallback(
+        () =>
+            Boolean(
+                webAudio && autoMix.eqTransitions && deckFxRef.current[0] && deckFxRef.current[1],
+            ),
+        [autoMix.eqTransitions, webAudio],
+    );
+
+    const getAutoMixPlan = useCallback(
+        (outgoing: 1 | 2, duration: number): MixPlan | null => {
+            const outgoingAnalysis = outgoing === 1 ? analysis1 : analysis2;
+            const incomingAnalysis = outgoing === 1 ? analysis2 : analysis1;
+            if (!outgoingAnalysis || !incomingAnalysis) return null;
+            return (
+                planMix(outgoingAnalysis, incomingAnalysis, duration, speed, autoMix) ??
+                (hasMixFx()
+                    ? planEchoOut(outgoingAnalysis, incomingAnalysis, duration, speed)
+                    : null)
+            );
+        },
+        [analysis1, analysis2, autoMix, hasMixFx, speed],
+    );
+
+    const createMix = useCallback(
+        (
+            outgoing: 1 | 2,
+            nextId: string | undefined,
+            plan: MixPlan | null,
+            fadeDuration: number,
+        ): MixHandlers => ({
+            djGains: hasMixFx(),
+            fadeStart: mixRef.current?.fadeStart,
+            nextId,
+            onCancel: cancelMix,
+            onError: (incoming) => {
+                if (mixRef.current?.incoming === incoming) mediaPause();
+            },
+            onFinished: () => {
+                // Progress ticks can run again before the store update re-renders.
+                const state = usePlayerStoreBase.getState();
+                if (!nextId || state.getCurrentSong()?._uniqueId === nextId) return;
+                if (outgoing === 1) handleOnEndedPlayer1();
+                else handleOnEndedPlayer2();
+            },
+            onPlaying: (incoming) => {
+                if (mixRef.current?.incoming === incoming) {
+                    incoming.playbackRate = mixRef.current.rate;
+                }
+            },
+            onStarted: (incoming, fadeStart, rate, startedId) => {
+                if (mixRef.current?.handedOff) cancelMix();
+                mixRef.current = {
+                    fadeStart,
+                    handedOff: false,
+                    incoming,
+                    maxDrift: 0,
+                    nextId: startedId,
+                    outgoing,
+                    rate,
+                    seeks: 0,
+                    style: plan?.style ?? null,
+                };
+                logAutoMixStart(
+                    plan,
+                    outgoing === 1 ? analysis1 : analysis2,
+                    outgoing === 1 ? analysis2 : analysis1,
+                    hasMixFx(),
+                    fadeStart,
+                );
+                scheduleFx(outgoing, plan, fadeStart, fadeDuration);
+            },
+            onSync: (drift, seeked) => {
+                const mix = mixRef.current;
+                if (!mix) return;
+                mix.maxDrift = Math.max(mix.maxDrift, Math.abs(drift));
+                if (seeked) mix.seeks++;
+            },
+            plan,
+            speed,
+        }),
+        [
+            analysis1,
+            analysis2,
+            cancelMix,
+            handleOnEndedPlayer1,
+            handleOnEndedPlayer2,
+            hasMixFx,
+            mediaPause,
+            scheduleFx,
+            speed,
+        ],
+    );
+
+    const handleProgress = useCallback(
+        (playerNum: 1 | 2, e: PlayerOnProgressProps) => {
+            const engine = playerRef.current;
+            const currentPlayer = playerNum === 1 ? engine?.player1() : engine?.player2();
+            const nextPlayer = playerNum === 1 ? engine?.player2() : engine?.player1();
+            const nextSong = playerNum === 1 ? player2 : player1;
+            if (!currentPlayer || !nextPlayer) {
+                return;
+            }
+
+            if (usePlayerStoreBase.getState().player.status !== PlayerStatus.PLAYING) {
+                return;
+            }
+
+            if (num === playerNum) {
+                setTimestamp(e.playedSeconds);
+            }
+
+            const currentDuration = getDuration(currentPlayer.ref);
+            if (repeat === PlayerRepeat.ONE) {
+                handleRepeatOne(playerNum, e.playedSeconds, currentDuration);
+                return;
+            }
+            if (transitionType === PlayerStyle.AUTO_MIX && skipAutoMixForTrackRef.current) return;
+
+            switch (transitionType) {
+                case PlayerStyle.AUTO_MIX:
+                case PlayerStyle.CROSSFADE: {
+                    const isMix = transitionType === PlayerStyle.AUTO_MIX;
+                    const plan =
+                        isMix && num === playerNum ? getAutoMixPlan(num, currentDuration) : null;
+                    const fadeDuration = isMix
+                        ? (plan?.fadeDuration ?? AUTO_MIX_FALLBACK_FADE_DURATION)
+                        : crossfadeDuration;
+                    crossfadeHandler({
+                        crossfadeDuration: fadeDuration,
+                        crossfadeStyle: isMix ? CrossfadeStyle.EQUAL_POWER : crossfadeStyle,
+                        currentPlayer,
+                        currentPlayerNum: num,
+                        currentTime: e.playedSeconds,
+                        duration: currentDuration,
+                        hasNextSong: Boolean(nextSong),
+                        isTransitioning,
+                        mix: isMix
+                            ? createMix(playerNum, nextSong?._uniqueId, plan, fadeDuration)
+                            : undefined,
+                        nextPlayer,
+                        playerNum,
+                        setIsTransitioning,
+                        volume,
+                    });
+                    break;
+                }
+                case PlayerStyle.GAPLESS:
+                    gaplessHandler({
+                        currentTime: e.playedSeconds,
+                        duration: currentDuration,
+                        hasNextSong: Boolean(nextSong),
+                        isFlac: false,
+                        isTransitioning,
+                        nextPlayer,
+                        setIsTransitioning,
+                    });
+                    break;
+            }
+        },
+        [
+            createMix,
+            crossfadeDuration,
+            crossfadeStyle,
+            getAutoMixPlan,
+            handleRepeatOne,
+            isTransitioning,
+            num,
+            player1,
+            player2,
+            repeat,
+            setTimestamp,
+            transitionType,
+            volume,
+        ],
+    );
+
+    const onProgressPlayer1 = useCallback(
+        (e: PlayerOnProgressProps) => handleProgress(1, e),
+        [handleProgress],
+    );
+    const onProgressPlayer2 = useCallback(
+        (e: PlayerOnProgressProps) => handleProgress(2, e),
+        [handleProgress],
+    );
+
     const player = usePlayer();
 
     usePlayerEvents(
@@ -557,22 +542,10 @@ export function WebPlayer() {
                             ? playerRef.current?.player1()?.ref
                             : playerRef.current?.player2()?.ref,
                     );
-                    const outgoingAnalysis = num === 1 ? analysis1 : analysis2;
-                    const incomingAnalysis = num === 1 ? analysis2 : analysis1;
-                    const autoMixPlan =
-                        outgoingAnalysis && incomingAnalysis
-                            ? planMix(
-                                  outgoingAnalysis,
-                                  incomingAnalysis,
-                                  currentDuration,
-                                  speed,
-                                  autoMix,
-                              )
-                            : null;
                     skipAutoMixForTrackRef.current = shouldSkipAutoMixAfterSeek(
                         timestamp,
                         currentDuration,
-                        autoMixPlan,
+                        getAutoMixPlan(num, currentDuration),
                         AUTO_MIX_FALLBACK_FADE_DURATION,
                     );
                 }
@@ -657,14 +630,11 @@ export function WebPlayer() {
             },
         },
         [
-            analysis1,
-            analysis2,
             audioFadeOnStatusChange,
-            autoMix,
             cancelMix,
+            getAutoMixPlan,
             isTransitioning,
             num,
-            speed,
             transitionType,
             volume,
         ],
@@ -924,21 +894,7 @@ function crossfadeHandler(args: {
     duration: number;
     hasNextSong: boolean;
     isTransitioning: boolean | string;
-    mix?: {
-        fadeStart: number | undefined;
-        nextId: string | undefined;
-        onCancel: () => void;
-        onError: (incoming: HTMLMediaElement) => void;
-        onPlaying: (incoming: HTMLMediaElement) => void;
-        onStarted: (
-            incoming: HTMLMediaElement,
-            fadeStart: number,
-            rate: number,
-            nextId: string,
-        ) => void;
-        plan: MixPlan | null;
-        speed: number;
-    };
+    mix?: MixHandlers;
     nextPlayer: {
         ref: null | ReactPlayer;
         setVolume: (volume: number) => void;
@@ -1008,14 +964,14 @@ function crossfadeHandler(args: {
                 )
                     return;
                 const plan = mix.plan;
-                const canMatch = Boolean(plan && currentTime - start < 0.15);
-                const rate = canMatch && plan ? plan.rate : mix.speed;
+                const rate = plan ? plan.rate : mix.speed;
                 incoming.playbackRate = rate;
                 if (incoming.readyState > 0) {
                     try {
-                        incoming.currentTime =
-                            (mix.plan?.incomingStart ?? 0) +
-                            (canMatch ? ((currentTime - start) * rate) / mix.speed : 0);
+                        // Start in phase even when the start was a few ticks late.
+                        incoming.currentTime = plan
+                            ? plan.incomingStart + ((currentTime - start) * rate) / mix.speed
+                            : 0;
                     } catch (error) {
                         logger.warn('Auto mix could not seek the next track', { error });
                         incoming.playbackRate = mix.speed;
@@ -1044,7 +1000,26 @@ function crossfadeHandler(args: {
         return;
     }
 
-    const fadeEnd = mix?.plan?.fadeEnd ?? duration;
+    const plan = mix?.plan;
+    if (mix && plan) {
+        if (currentTime >= plan.fadeEnd && plan.fadeEnd < duration - 0.25) {
+            mix.onFinished();
+            return;
+        }
+        const incoming = nextPlayer.ref?.getInternalPlayer() as HTMLMediaElement | undefined;
+        if (plan.style === 'blend' && mix.fadeStart !== undefined && incoming) {
+            const sync = syncIncoming(incoming, plan, currentTime, mix.speed);
+            if (sync) mix.onSync(sync.drift, sync.seeked);
+        }
+        if (mix.djGains) {
+            const gains = mixGains(plan, currentTime);
+            currentPlayer.setVolume(gains.outgoing * volume);
+            nextPlayer.setVolume(gains.incoming * volume);
+            return;
+        }
+    }
+
+    const fadeEnd = plan?.fadeEnd ?? duration;
     const timeLeft = fadeEnd - currentTime;
     const fadeDuration = mix?.fadeStart === undefined ? crossfadeDuration : fadeEnd - mix.fadeStart;
     const progress = (fadeDuration - timeLeft) / fadeDuration;
@@ -1220,6 +1195,50 @@ function linearEase(t: number): number {
     return Math.max(0, Math.min(1, t));
 }
 
+/** One line per transition: which kind was chosen, where, and why. */
+function logAutoMixStart(
+    plan: MixPlan | null,
+    outgoing: null | TrackAnalysis,
+    incoming: null | TrackAnalysis,
+    hasFx: boolean,
+    at: number,
+) {
+    const tracks = {
+        incomingBpm: incoming ? round2(incoming.start.bpm) : undefined,
+        incomingKey: incoming?.key?.camelot,
+        outgoingBpm: outgoing ? round2(outgoing.end.bpm) : undefined,
+        outgoingKey: outgoing?.key?.camelot,
+    };
+    if (!plan) {
+        const reason =
+            !outgoing || !incoming
+                ? `missing analysis (${!outgoing ? 'outgoing' : 'incoming'})`
+                : hasFx
+                  ? 'no beat-matched blend or echo-out fits'
+                  : 'tempos not matchable and echo-out needs web audio EQ';
+        logger.info('Auto mix transition: crossfade fallback', {
+            at: round2(at),
+            reason,
+            ...tracks,
+        });
+        return;
+    }
+    logger.info(`Auto mix transition: ${plan.style}`, {
+        bars: plan.bars,
+        bassSwapAt: round2(plan.bassSwapAt),
+        cutBeforeOutro: outgoing ? round2(outgoing.outroStart - plan.fadeEnd) : undefined,
+        fadeEnd: round2(plan.fadeEnd),
+        incomingStart: round2(plan.incomingStart),
+        rate: round2(plan.rate),
+        start: round2(plan.start),
+        ...tracks,
+    });
+}
+
+function round2(value: number) {
+    return Math.round(value * 100) / 100;
+}
+
 /**
  * S-Curve easing (smoothstep) - smooth S-shaped curve
  * Uses smoothstep function: t²(3 - 2t)
@@ -1227,4 +1246,27 @@ function linearEase(t: number): number {
 function sCurveEase(t: number): number {
     const clampedT = Math.max(0, Math.min(1, t));
     return clampedT * clampedT * (3 - 2 * clampedT);
+}
+
+/** Keeps the incoming deck on the outgoing beat grid during a blend. */
+function syncIncoming(
+    incoming: HTMLMediaElement,
+    plan: MixPlan,
+    currentTime: number,
+    speed: number,
+): null | { drift: number; seeked: boolean } {
+    if (incoming.paused || incoming.seeking || currentTime < plan.start) return null;
+    const expected = plan.incomingStart + ((currentTime - plan.start) * plan.rate) / speed;
+    const drift = incoming.currentTime - expected;
+    const rate = syncPlaybackRate(drift, plan.rate);
+    try {
+        if (rate === null) {
+            incoming.currentTime = expected;
+        } else if (Math.abs(incoming.playbackRate - rate) > 1e-4) {
+            incoming.playbackRate = rate;
+        }
+    } catch (error) {
+        logger.warn('Auto mix could not sync the next track', { error });
+    }
+    return { drift, seeked: rate === null };
 }

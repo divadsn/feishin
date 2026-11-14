@@ -15,7 +15,7 @@ export interface BeatGrid {
     offset: number;
 }
 
-export type EnergyFlow = 'build' | 'free' | 'steady';
+export type EnergyFlow = 'auto' | 'build' | 'free' | 'steady';
 
 export interface MixCandidate extends MixFeatures {
     /** Consecutive tracks sharing a group (album) move as one block. */
@@ -39,12 +39,18 @@ export interface MixPlan {
     bars: number;
     /** Outgoing track time at which the low end swaps from the outgoing to the incoming track. */
     bassSwapAt: number;
+    /** Outgoing beat length in track seconds. */
+    beat: number;
     fadeDuration: number;
+    /** Outgoing track time at which the mix is done; before the track end when mixing out early. */
     fadeEnd: number;
     incomingStart: number;
     rate: number;
     start: number;
+    style: MixStyle;
 }
+
+export type MixStyle = 'blend' | 'echo';
 
 export interface TrackAnalysis {
     audibleEnd: number;
@@ -60,9 +66,11 @@ export interface TrackAnalysis {
     start: BeatGrid;
 }
 
+type FlowMode = 'build' | 'free' | 'release' | 'steady';
+
 export const DEFAULT_AUTO_MIX_OPTIONS: AutoMixOptions = {
     blendLength: 'auto',
-    energyFlow: 'steady',
+    energyFlow: 'auto',
     harmonicMixing: true,
     maxTempoAdjust: 8,
 };
@@ -72,6 +80,11 @@ const AUTO_BLEND_BARS = [32, 16, 8];
 const MIN_AUTO_BLEND_BARS = 8;
 const KEY_CLASH_BLEND_BARS = 4;
 const MAX_SECTION_BARS = 32;
+const PHRASE_BARS = 8;
+// Seconds a blend may end before the outro starts to keep the energy up.
+const MAX_EARLY_MIX_OUT = 60;
+// Mix points scoring within this of the best are equal; the latest one wins.
+const ENERGY_MARGIN = 0.12;
 // Tracks this close in tempo mix without adjustment even when tempo matching is off.
 const TEMPO_TOLERANCE = 0.02;
 const TEMPO_FACTORS = [0.5, 1, 2];
@@ -215,6 +228,28 @@ export function camelotDistance(a: string, b: string): number {
     return Math.min(diff, 12 - diff) + (parsedA.letter === parsedB.letter ? 0 : 1);
 }
 
+/** Deck volumes (0..1) at outgoing track `time` during a mix. */
+export function mixGains(plan: MixPlan, time: number): { incoming: number; outgoing: number } {
+    const length = Math.max(1e-3, plan.fadeEnd - plan.start);
+    if (plan.style === 'echo') {
+        return { incoming: 1, outgoing: 1 - clamp((time - plan.start) / length, 0, 1) };
+    }
+
+    // Bring the incoming deck up early (its bass is cut until the swap), keep the outgoing deck
+    // at full until the swap, then take it out.
+    const rise = Math.max(plan.beat * BEATS_PER_BAR, length / 4);
+    const fadeIn = clamp((time - plan.start) / rise, 0, 1);
+    const fadeOut = clamp(
+        (time - plan.bassSwapAt) / Math.max(1e-3, plan.fadeEnd - plan.bassSwapAt),
+        0,
+        1,
+    );
+    return {
+        incoming: Math.sin((Math.PI / 2) * fadeIn),
+        outgoing: Math.cos((Math.PI / 2) * fadeOut),
+    };
+}
+
 /**
  * Greedy nearest-neighbour ordering by tempo, key and energy. Tracks without usable features,
  * or without a good match, keep their relative order. Consecutive tracks of the same group
@@ -224,6 +259,8 @@ export function orderForMix<T extends MixCandidate>(
     tracks: readonly T[],
     current: MixFeatures | null,
     options: AutoMixOptions = DEFAULT_AUTO_MIX_OPTIONS,
+    /** Queue position of the first track, for the 'auto' set arc. */
+    startPosition = 0,
 ): T[] {
     const remaining = groupBlocks(tracks);
     const sorted: T[] = [];
@@ -234,7 +271,12 @@ export function orderForMix<T extends MixCandidate>(
         let bestCost = Number.POSITIVE_INFINITY;
         if (previous) {
             for (let index = 0; index < remaining.length; index++) {
-                const cost = transitionCost(previous, remaining[index][0], options);
+                const cost = transitionCost(
+                    previous,
+                    remaining[index][0],
+                    options,
+                    startPosition + sorted.length,
+                );
                 if (cost !== null && cost < bestCost) {
                     bestCost = cost;
                     bestIndex = index;
@@ -285,8 +327,68 @@ export function pickForMix<T extends MixCandidate>(
     last: MixFeatures | null,
     count: number,
     options: AutoMixOptions = DEFAULT_AUTO_MIX_OPTIONS,
+    startPosition = 0,
 ): T[] {
-    return orderForMix(candidates, last, options).slice(0, Math.max(0, count));
+    return orderForMix(candidates, last, options, startPosition).slice(0, Math.max(0, count));
+}
+
+/**
+ * Echo-out for tracks whose tempos cannot be matched: on a downbeat at the outro the outgoing
+ * track drops out within a beat while an echo of it rings on, and the incoming track starts on
+ * its first bar at full volume.
+ */
+export function planEchoOut(
+    outgoing: TrackAnalysis,
+    incoming: TrackAnalysis,
+    duration: number,
+    speed: number,
+): MixPlan | null {
+    const grid = outgoing.end;
+    const bar = barLength(grid.bpm);
+    if (
+        !bar ||
+        ![
+            duration,
+            speed,
+            grid.offset,
+            outgoing.audibleStart,
+            outgoing.audibleEnd,
+            outgoing.outroStart,
+            incoming.audibleStart,
+            incoming.audibleEnd,
+        ].every(Number.isFinite) ||
+        speed <= 0
+    ) {
+        return null;
+    }
+
+    const audibleEnd = Math.min(duration, outgoing.audibleEnd);
+    const cut = snapToGrid(Math.min(outgoing.outroStart, audibleEnd - bar), grid.offset, bar);
+    const beat = bar / BEATS_PER_BAR;
+    const incomingStart = barLength(incoming.start.bpm)
+        ? firstBarAfter(incoming.audibleStart, incoming.start)
+        : incoming.audibleStart;
+    if (
+        cut <= 0 ||
+        cut < outgoing.audibleStart ||
+        cut + beat > duration ||
+        incomingStart < 0 ||
+        incomingStart >= incoming.audibleEnd
+    ) {
+        return null;
+    }
+
+    return {
+        bars: 0,
+        bassSwapAt: cut,
+        beat,
+        fadeDuration: beat,
+        fadeEnd: cut + beat,
+        incomingStart,
+        rate: speed,
+        start: cut,
+        style: 'echo',
+    };
 }
 
 export function planMix(
@@ -331,15 +433,13 @@ export function planMix(
 
     const bar = barLength(outgoingGrid.bpm);
     const incomingBar = barLength(incomingGrid.bpm);
-    const fadeEnd = Math.min(duration, outgoing.audibleEnd);
-    const incomingStart =
-        incomingGrid.offset +
-        Math.ceil((incoming.audibleStart - incomingGrid.offset) / incomingBar) * incomingBar;
+    const audibleEnd = Math.min(duration, outgoing.audibleEnd);
+    const firstBar = firstBarAfter(incoming.audibleStart, incomingGrid);
+    const introBars = Math.max(0, Math.round((incoming.introEnd - firstBar) / incomingBar));
 
     let bars: number;
     if (options.blendLength === 'auto') {
-        const outroBars = (fadeEnd - outgoing.outroStart) / bar;
-        const introBars = (incoming.introEnd - incomingStart) / incomingBar;
+        const outroBars = (audibleEnd - outgoing.outroStart) / bar;
         const available = Math.min(outroBars, introBars);
         bars = AUTO_BLEND_BARS.find((count) => count <= available) ?? MIN_AUTO_BLEND_BARS;
     } else {
@@ -357,9 +457,21 @@ export function planMix(
 
     // Keep phrase-length blends, at most a quarter of the track.
     while (bars > 2 && bars * bar > duration * 0.25) bars /= 2;
-    const targetStart = fadeEnd - bar * bars;
-    const start = snapToGrid(targetStart, outgoingGrid.offset, bar);
+
+    // Mix out at the start of the outro like a DJ and skip the tail. When the outro is too
+    // short for the blend (abrupt ending), blend into the end of the track instead.
+    const outroStart = snapToGrid(outgoing.outroStart, outgoingGrid.offset, bar);
+    const mixOut = outroStart + bars * bar <= audibleEnd + 1e-6;
+    const start = mixOut
+        ? outroStart
+        : snapToGrid(audibleEnd - bar * bars, outgoingGrid.offset, bar);
+    const fadeEnd = mixOut ? outroStart + bars * bar : audibleEnd;
     const actualFadeDuration = fadeEnd - start;
+    const actualBars = Math.round(actualFadeDuration / bar);
+
+    // Line the incoming drop (end of its intro) up with the end of the blend.
+    const leadBars = Math.min(introBars, actualBars);
+    const incomingStart = firstBar + (introBars - leadBars) * incomingBar;
 
     if (
         start < 0 ||
@@ -371,15 +483,84 @@ export function planMix(
         return null;
     }
 
-    return {
-        bars: Math.round(actualFadeDuration / bar),
-        bassSwapAt: start + Math.max(1, Math.round(actualFadeDuration / 2 / bar)) * bar,
+    // Swap the bass halfway, or at the incoming drop when it arrives earlier.
+    const swapBars = Math.max(1, Math.min(Math.round(actualFadeDuration / 2 / bar), leadBars));
+    const planAt = (from: number): MixPlan => ({
+        bars: actualBars,
+        bassSwapAt: from + swapBars * bar,
+        beat: bar / BEATS_PER_BAR,
         fadeDuration: actualFadeDuration,
-        fadeEnd,
+        fadeEnd: from + actualFadeDuration,
         incomingStart,
         rate: speed * ratio,
-        start,
-    };
+        start: from,
+        style: 'blend',
+    });
+
+    const anchor = planAt(start);
+    const outgoingBody = bodyLevel(outgoing.energy);
+    const incomingBody = bodyLevel(incoming.energy);
+    if (!outgoingBody || !incomingBody) return anchor;
+
+    // Like a DJ keeping the floor going: try mixing out whole phrases earlier (up to a minute
+    // before the outro) or later, and keep the latest point whose blend holds the energy about
+    // as well as the best one.
+    const phrase = PHRASE_BARS * bar;
+    const earliestEnd = Math.max(
+        outroStart - MAX_EARLY_MIX_OUT,
+        duration / 2 + actualFadeDuration,
+        outgoing.audibleStart + actualFadeDuration,
+    );
+    const candidates: MixPlan[] = [];
+    for (let k = -Math.ceil(MAX_EARLY_MIX_OUT / phrase) - 1; ; k++) {
+        const candidate = planAt(start + k * phrase);
+        if (candidate.fadeEnd > audibleEnd + 1e-6) break;
+        if (k === 0 || candidate.fadeEnd >= earliestEnd) candidates.push(candidate);
+    }
+    const scored = candidates.map((candidate) => ({
+        candidate,
+        score: blendEnergy(candidate, outgoing, outgoingBody, incoming, incomingBody, ratio),
+    }));
+    const best = Math.max(...scored.map(({ score }) => score));
+    return scored.filter(({ score }) => score >= best - ENERGY_MARGIN).pop()?.candidate ?? anchor;
+}
+
+const SYNC_TOLERANCE = 0.015;
+const SYNC_MAX_DRIFT = 0.1;
+const SYNC_MAX_NUDGE = 0.03;
+// Rate change per second of drift; quantized to 1% steps to avoid constant rate changes.
+const SYNC_GAIN = 0.6;
+
+/**
+ * Playback rate that pulls the incoming deck back onto the beat. `drift` is how far the incoming
+ * deck is ahead (positive) or behind (negative) in seconds. Returns null when it is too far off
+ * to nudge and should be seeked instead.
+ */
+export function syncPlaybackRate(drift: number, rate: number): null | number {
+    if (!Number.isFinite(drift) || Math.abs(drift) > SYNC_MAX_DRIFT) return null;
+    if (Math.abs(drift) < SYNC_TOLERANCE) return rate;
+    const nudge = clamp(Math.round(drift * SYNC_GAIN * 100) / 100, -SYNC_MAX_NUDGE, SYNC_MAX_NUDGE);
+    return rate * (1 - (nudge || Math.sign(drift) * 0.01));
+}
+
+// Set arc in tracks: warm up, then repeat peak, breather and build.
+const ARC_WARM_UP = 8;
+const ARC_CYCLE: [FlowMode, number][] = [
+    ['steady', 10],
+    ['release', 2],
+    ['build', 4],
+];
+
+/** Energy direction for the track at `position` in the queue with the 'auto' set arc. */
+export function arcFlow(position: number): FlowMode {
+    if (position < ARC_WARM_UP) return 'build';
+    const cycle = ARC_CYCLE.reduce((total, [, length]) => total + length, 0);
+    let step = (position - ARC_WARM_UP) % cycle;
+    for (const [mode, length] of ARC_CYCLE) {
+        if (step < length) return mode;
+        step -= length;
+    }
+    return 'steady';
 }
 
 /** Cost of mixing from `a` into `b`: 0 is perfect, above 1 is a poor match, null is unknown. */
@@ -387,6 +568,8 @@ export function transitionCost(
     a: MixFeatures,
     b: MixFeatures,
     options: AutoMixOptions = DEFAULT_AUTO_MIX_OPTIONS,
+    /** Queue position of `b`, for the 'auto' set arc. */
+    position = 0,
 ): null | number {
     let total = 0;
     let weights = 0;
@@ -410,14 +593,20 @@ export function transitionCost(
         }
     }
 
-    if (options.energyFlow !== 'free' && isFiniteNumber(a.energy) && isFiniteNumber(b.energy)) {
+    const flow = options.energyFlow === 'auto' ? arcFlow(position) : options.energyFlow;
+    if (flow !== 'free' && isFiniteNumber(a.energy) && isFiniteNumber(b.energy)) {
         const delta = b.energy - a.energy;
+        // Build favours small rises, release small drops, steady neither.
         const cost =
-            options.energyFlow === 'build'
+            flow === 'build'
                 ? delta < 0
                     ? -delta / 0.1
                     : delta / 0.4
-                : Math.abs(delta) / 0.3;
+                : flow === 'release'
+                  ? delta > 0
+                      ? delta / 0.1
+                      : -delta / 0.4
+                  : Math.abs(delta) / 0.3;
         total += 0.4 * cost;
         weights += 0.4;
     }
@@ -427,6 +616,34 @@ export function transitionCost(
 
 function barLength(bpm: number): number {
     return Number.isFinite(bpm) && bpm > 0 ? (60 / bpm) * BEATS_PER_BAR : 0;
+}
+
+/** Mean energy of the mix over a blend, relative to each track's typical (body) level. */
+function blendEnergy(
+    plan: MixPlan,
+    outgoing: TrackAnalysis,
+    outgoingBody: number,
+    incoming: TrackAnalysis,
+    incomingBody: number,
+    ratio: number,
+): number {
+    let sum = 0;
+    let count = 0;
+    for (let time = plan.start; time < plan.fadeEnd; time += 1) {
+        const gains = mixGains(plan, time);
+        const incomingTime = plan.incomingStart + (time - plan.start) * ratio;
+        const out = (outgoing.energy[Math.floor(time)] ?? 0) / outgoingBody;
+        const into = (incoming.energy[Math.floor(incomingTime)] ?? 0) / incomingBody;
+        sum += Math.min(1.5, Math.max(out * gains.outgoing, into * gains.incoming));
+        count++;
+    }
+    return count ? sum / count : 0;
+}
+
+/** Typical loudness of the audible part of a track, or 0 without a usable profile. */
+function bodyLevel(energy: number[]): number {
+    const audible = energy.filter((value) => value > 0.02).sort((a, b) => a - b);
+    return audible.length < 8 ? 0 : audible[Math.floor(audible.length / 2)];
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -453,9 +670,14 @@ function correlation(a: ArrayLike<number>, b: ArrayLike<number>): number {
 }
 
 function energyThreshold(energy: number[]): null | number {
-    const audible = energy.filter((value) => value > 0.02).sort((a, b) => a - b);
-    if (audible.length < 8) return null;
-    return audible[Math.floor(audible.length / 2)] * 0.6;
+    const body = bodyLevel(energy);
+    return body ? body * 0.6 : null;
+}
+
+/** First bar of `grid` at or after `time`. */
+function firstBarAfter(time: number, grid: BeatGrid): number {
+    const bar = barLength(grid.bpm);
+    return grid.offset + Math.ceil((time - grid.offset) / bar - 1e-9) * bar;
 }
 
 function groupBlocks<T extends MixCandidate>(tracks: readonly T[]): T[][] {

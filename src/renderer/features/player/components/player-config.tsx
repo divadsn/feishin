@@ -466,6 +466,7 @@ const AutoMixEnergyFlowConfig = () => {
         <Select
             comboboxProps={{ withinPortal: false }}
             data={[
+                { label: t('setting.autoMixEnergyFlow_optionAuto'), value: 'auto' },
                 { label: t('setting.autoMixEnergyFlow_optionSteady'), value: 'steady' },
                 { label: t('setting.autoMixEnergyFlow_optionBuild'), value: 'build' },
                 { label: t('setting.autoMixEnergyFlow_optionFree'), value: 'free' },
